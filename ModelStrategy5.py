@@ -31,7 +31,30 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 import os
 import time
+import logging
+from pathlib import Path
 warnings.filterwarnings('ignore')
+
+# Setup comprehensive logging
+def setup_logging():
+    """Setup logging system for the trading bot"""
+    log_dir = Path('logs')
+    log_dir.mkdir(exist_ok=True)
+    
+    log_filename = log_dir / f'trading_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ]
+    )
+    
+    return logging.getLogger('TradingBot')
+
+logger = setup_logging()
 
 # Configuration
 class Config:
@@ -48,18 +71,30 @@ class Config:
     MACD_SLOW = 26
     MACD_SIGNAL = 9
    
-    # Training periods
+    # Training periods - Updated for mid-2025 coverage
     TRAIN_START = "2019-01-01"
     TRAIN_END = "2023-12-31"
     VAL_START = "2024-01-01"
     VAL_END = "2024-12-31"
     TEST_START = "2025-01-01"
-    TEST_END = "2025-12-31"
+    TEST_END = "2025-06-30"  # Mid-2025 as per requirements
    
     # Machine Learning Parameters
     FFT_WINDOW = 120 # 10 hours of 5-min bars
     HILBERT_WINDOW = 60 # 5 hours for phase analysis
     LOOKBACK_PERIODS = [5, 10, 20, 50, 100] # Multiple timeframes
+    
+    # Risk Management Parameters
+    MIN_RISK_PCT = 0.02  # 2% per trade
+    MAX_RISK_PCT = 0.05  # 5% per trade
+    MAX_DRAWDOWN_PCT = 0.25  # 25% maximum drawdown
+    MAX_CONCURRENT_POSITIONS = 3  # 1-3 positions
+    ATR_PERIOD = 14  # ATR for stop loss
+    
+    # Exit Strategy Parameters
+    PEAK_DROP_PCT = 0.15  # Exit when histogram drops 15% from peak
+    DECLINE_BARS = 3  # Exit when declining for 3 bars
+    ML_CONFIDENCE_THRESHOLD = 0.6  # Minimum ML confidence
    
     # LightGBM Parameters
     LGBM_PARAMS = {
@@ -273,6 +308,70 @@ class MLFeatureEngine:
        
         return peaks, troughs
    
+    def detect_zero_crossings(self, macd_hist):
+        """
+        Detect MACD histogram zero crossings
+        
+        Returns:
+            zero_to_positive: indices where histogram crosses from zero to positive
+            zero_to_negative: indices where histogram crosses from zero to negative
+        """
+        zero_to_positive = []
+        zero_to_negative = []
+        
+        for i in range(1, len(macd_hist)):
+            if np.isnan(macd_hist[i]) or np.isnan(macd_hist[i-1]):
+                continue
+                
+            # Zero to positive (BUY signal)
+            if macd_hist[i-1] <= 0 and macd_hist[i] > 0:
+                zero_to_positive.append(i)
+            
+            # Zero to negative (SELL signal)
+            elif macd_hist[i-1] >= 0 and macd_hist[i] < 0:
+                zero_to_negative.append(i)
+        
+        return np.array(zero_to_positive), np.array(zero_to_negative)
+    
+    def predict_turning_points(self, macd_hist, lookforward=10):
+        """
+        Create labels for turning point prediction
+        
+        For each point, predict if a max or min will occur in the next N bars
+        Returns distance to next turning point and type
+        """
+        labels = np.zeros(len(macd_hist))
+        distances = np.zeros(len(macd_hist))
+        
+        peaks, troughs = self.detect_peaks_troughs(macd_hist, prominence=0.05)
+        
+        # For each position, find the next turning point
+        for i in range(len(macd_hist)):
+            # Find next peak
+            next_peaks = peaks[peaks > i]
+            # Find next trough
+            next_troughs = troughs[troughs > i]
+            
+            if len(next_peaks) > 0 and len(next_troughs) > 0:
+                next_peak = next_peaks[0]
+                next_trough = next_troughs[0]
+                
+                # Which comes first?
+                if next_peak < next_trough:
+                    labels[i] = 1  # Expect peak (maximum)
+                    distances[i] = next_peak - i
+                else:
+                    labels[i] = -1  # Expect trough (minimum)
+                    distances[i] = next_trough - i
+            elif len(next_peaks) > 0:
+                labels[i] = 1
+                distances[i] = next_peaks[0] - i
+            elif len(next_troughs) > 0:
+                labels[i] = -1
+                distances[i] = next_troughs[0] - i
+        
+        return labels, distances
+    
     def create_cycle_labels(self, df):
         """
         Create target labels for cycle stages
@@ -286,7 +385,7 @@ class MLFeatureEngine:
         """
         labels = np.zeros(len(df))
        
-        macd = df['macd'].values
+        macd = df['macd_hist'].values if 'macd_hist' in df.columns else df['macd'].values
        
         # Detect peaks and troughs
         peaks, troughs = self.detect_peaks_troughs(macd, prominence=0.05)
@@ -368,6 +467,17 @@ class MLFeatureEngine:
        
         # Add cycle labels
         features['cycle_stage'] = self.create_cycle_labels(df)
+        
+        # Add turning point prediction labels
+        turning_labels, turning_distances = self.predict_turning_points(df['macd_hist'].values)
+        features['next_turning_point'] = turning_labels  # 1=max, -1=min
+        features['distance_to_turning'] = turning_distances
+        
+        # Add zero crossing indicators
+        zero_to_pos, zero_to_neg = self.detect_zero_crossings(df['macd_hist'].values)
+        features['is_zero_crossing'] = 0
+        features.iloc[zero_to_pos, features.columns.get_loc('is_zero_crossing')] = 1
+        features.iloc[zero_to_neg, features.columns.get_loc('is_zero_crossing')] = -1
        
         # Add time features
         features['hour'] = df.index.hour
@@ -508,6 +618,86 @@ class MLTradingModel:
        
         return cv_results
 
+class RiskManager:
+    """Advanced risk management system"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.initial_balance = None
+        self.peak_balance = None
+        self.open_positions = []
+        self.trade_history = []
+        
+    def set_initial_balance(self, balance):
+        """Set the initial account balance"""
+        self.initial_balance = balance
+        self.peak_balance = balance
+        
+    def update_peak_balance(self, current_balance):
+        """Update peak balance for drawdown calculation"""
+        if current_balance > self.peak_balance:
+            self.peak_balance = current_balance
+    
+    def calculate_drawdown(self, current_balance):
+        """Calculate current drawdown percentage"""
+        if self.peak_balance is None or self.peak_balance == 0:
+            return 0
+        return (self.peak_balance - current_balance) / self.peak_balance
+    
+    def is_max_drawdown_reached(self, current_balance):
+        """Check if maximum drawdown limit is reached"""
+        drawdown = self.calculate_drawdown(current_balance)
+        return drawdown >= self.config.MAX_DRAWDOWN_PCT
+    
+    def can_open_position(self):
+        """Check if we can open a new position"""
+        return len(self.open_positions) < self.config.MAX_CONCURRENT_POSITIONS
+    
+    def calculate_position_size(self, balance, confidence, atr, price):
+        """
+        Calculate position size based on risk parameters
+        
+        Args:
+            balance: Account balance
+            confidence: ML confidence (0-1)
+            atr: Average True Range
+            price: Current price
+            
+        Returns:
+            Position size in lots
+        """
+        # Risk percentage scales with confidence (2-5%)
+        risk_pct = self.config.MIN_RISK_PCT + (self.config.MAX_RISK_PCT - self.config.MIN_RISK_PCT) * confidence
+        
+        # Risk amount in dollars
+        risk_amount = balance * risk_pct
+        
+        # Stop loss distance based on ATR (2x ATR)
+        stop_distance = 2 * atr
+        
+        # Position size = Risk amount / Stop distance
+        position_size = risk_amount / stop_distance if stop_distance > 0 else 0
+        
+        # Convert to lots (assuming 1 lot = price * 1)
+        lots = position_size / price
+        
+        # Round to 2 decimals and ensure minimum
+        lots = max(0.01, round(lots, 2))
+        
+        return lots
+    
+    def add_position(self, position_info):
+        """Add a new open position"""
+        self.open_positions.append(position_info)
+    
+    def remove_position(self, ticket):
+        """Remove a closed position"""
+        self.open_positions = [p for p in self.open_positions if p.get('ticket') != ticket]
+    
+    def add_trade(self, trade_info):
+        """Add completed trade to history"""
+        self.trade_history.append(trade_info)
+
 class EnhancedTradingBot:
     """Enhanced trading bot with ML capabilities"""
    
@@ -516,27 +706,40 @@ class EnhancedTradingBot:
         self.connected = False
         self.feature_engine = MLFeatureEngine(self.config)
         self.ml_model = MLTradingModel(self.config)
+        self.risk_manager = RiskManager(self.config)
         self.current_status = "Initialized"
         self.model_trained = False
         self.current_position = 0  # 1: long, -1: short, 0: none
+        self.position_peak_hist = {}  # Track peak histogram values for exits
+        self.position_decline_bars = {}  # Track declining bars for exits
        
     def connect_mt5(self):
         """Connect to MetaTrader 5"""
         try:
             if not mt5.initialize():
+                logger.error("MT5 initialization failed")
                 print("MT5 initialization failed")
                 return False
                
             if not mt5.login(self.config.LOGIN, self.config.PASSWORD, self.config.SERVER):
+                logger.error("MT5 login failed")
                 print("MT5 login failed")
                 return False
+            
+            # Get and set initial account balance
+            account_info = mt5.account_info()
+            if account_info:
+                self.risk_manager.set_initial_balance(account_info.balance)
+                logger.info(f"Initial account balance: ${account_info.balance:.2f}")
                
             self.connected = True
             self.current_status = "Connected to MT5"
+            logger.info("Successfully connected to MT5")
             print("Successfully connected to MT5")
             return True
            
         except Exception as e:
+            logger.error(f"Connection error: {e}")
             print(f"Connection error: {e}")
             return False
    
@@ -609,15 +812,117 @@ class EnhancedTradingBot:
                 ema_values[i] = (prices[i] - ema_values[i-1]) * multiplier + ema_values[i-1]
            
         return ema_values
+    
+    def calculate_atr(self, df, period=14):
+        """Calculate Average True Range for stop loss"""
+        high = df['high'].values
+        low = df['low'].values
+        close = df['close'].values
+        
+        tr = np.zeros(len(df))
+        
+        for i in range(1, len(df)):
+            h_l = high[i] - low[i]
+            h_pc = abs(high[i] - close[i-1])
+            l_pc = abs(low[i] - close[i-1])
+            tr[i] = max(h_l, h_pc, l_pc)
+        
+        # Calculate ATR as SMA of TR
+        atr = pd.Series(tr).rolling(window=period).mean().values
+        df['atr'] = atr
+        
+        return df
    
+    def should_exit_position(self, df, position_type, current_idx):
+        """
+        Determine if position should be exited based on:
+        1. ML predicts turning point
+        2. Histogram drops X% from peak
+        3. Histogram declining for 2-3 bars
+        
+        Args:
+            df: DataFrame with MACD data
+            position_type: 1 for long, -1 for short
+            current_idx: Current index position
+            
+        Returns:
+            (should_exit, reason)
+        """
+        if current_idx < 3:
+            return False, ""
+        
+        hist = df['macd_hist'].iloc[current_idx]
+        hist_prev = df['macd_hist'].iloc[current_idx-1:current_idx+1].values
+        
+        # Check for ML predicted turning point
+        if 'next_turning_point' in df.columns:
+            next_turn = df['next_turning_point'].iloc[current_idx]
+            distance = df['distance_to_turning'].iloc[current_idx]
+            
+            # If turning point predicted within 3 bars
+            if distance <= 3:
+                if position_type == 1 and next_turn == 1:
+                    # Long position, maximum predicted soon
+                    return True, "ML predicts maximum approaching"
+                elif position_type == -1 and next_turn == -1:
+                    # Short position, minimum predicted soon
+                    return True, "ML predicts minimum approaching"
+        
+        # Track peak/trough for this position
+        ticket_key = f"pos_{current_idx}"
+        
+        if position_type == 1:  # Long position
+            # Track peak histogram value
+            if ticket_key not in self.position_peak_hist:
+                self.position_peak_hist[ticket_key] = hist
+            else:
+                self.position_peak_hist[ticket_key] = max(self.position_peak_hist[ticket_key], hist)
+            
+            peak = self.position_peak_hist[ticket_key]
+            
+            # Check if dropped X% from peak
+            if peak > 0 and (peak - hist) / peak >= self.config.PEAK_DROP_PCT:
+                return True, f"Histogram dropped {self.config.PEAK_DROP_PCT*100:.0f}% from peak"
+            
+            # Check for declining bars
+            if len(hist_prev) >= 3:
+                recent_hist = df['macd_hist'].iloc[current_idx-2:current_idx+1].values
+                if all(recent_hist[i] > recent_hist[i+1] for i in range(len(recent_hist)-1)):
+                    return True, "Histogram declining for 3 bars"
+        
+        elif position_type == -1:  # Short position
+            # Track trough histogram value (most negative)
+            if ticket_key not in self.position_peak_hist:
+                self.position_peak_hist[ticket_key] = hist
+            else:
+                self.position_peak_hist[ticket_key] = min(self.position_peak_hist[ticket_key], hist)
+            
+            trough = self.position_peak_hist[ticket_key]
+            
+            # Check if rose X% from trough
+            if trough < 0 and (hist - trough) / abs(trough) >= self.config.PEAK_DROP_PCT:
+                return True, f"Histogram rose {self.config.PEAK_DROP_PCT*100:.0f}% from trough"
+            
+            # Check for rising bars
+            if len(hist_prev) >= 3:
+                recent_hist = df['macd_hist'].iloc[current_idx-2:current_idx+1].values
+                if all(recent_hist[i] < recent_hist[i+1] for i in range(len(recent_hist)-1)):
+                    return True, "Histogram rising for 3 bars"
+        
+        return False, ""
+    
     def generate_ml_signals(self, features_df):
         """
         Generate trading signals using ML predictions
        
-        Signal generation based on:
-        - Predicted cycle stage
+        ENHANCED Signal generation based on:
+        - MACD histogram zero crossings
+        - ML-predicted turning points
         - Uncertainty bounds from quantile predictions
-        - Feature importance weighting
+        - Zero to Maximum = BUY
+        - Zero to Minimum = SELL
+        - Maximum to Zero = EXIT LONG
+        - Minimum to Zero = EXIT SHORT
         """
         if not self.model_trained:
             print("Model not trained. Please train the model first.")
@@ -632,7 +937,8 @@ class EnhancedTradingBot:
        
         # Get feature columns (exclude targets and identifiers)
         feature_cols = [col for col in valid_features.columns
-                       if col not in ['cycle_stage', 'signal', 'equity']]
+                       if col not in ['cycle_stage', 'signal', 'equity', 'ml_signal', 
+                                     'ml_confidence', 'next_turning_point', 'distance_to_turning']]
        
         X = valid_features[feature_cols]
        
@@ -641,6 +947,7 @@ class EnhancedTradingBot:
        
         # Create signals based on predictions and uncertainty
         signals = np.zeros(len(features_df))
+        exit_signals = np.zeros(len(features_df))
        
         # Map predictions back to original indices
         pred_main = predictions['main']
@@ -650,80 +957,171 @@ class EnhancedTradingBot:
         # Calculate confidence as inverse of prediction spread
         confidence = 1 / (1 + np.abs(pred_q90 - pred_q10))
        
-        # Generate signals based on predicted cycle stage and confidence
+        # Generate signals based on zero crossings and ML predictions
         for i, idx in enumerate(valid_features.index):
             pos = features_df.index.get_loc(idx)
-           
-            predicted_stage = pred_main[i]
+            
+            # Get zero crossing status
+            is_zero_cross = features_df.loc[idx, 'is_zero_crossing']
+            next_turn = features_df.loc[idx, 'next_turning_point']
+            distance = features_df.loc[idx, 'distance_to_turning']
             conf = confidence[i]
-           
-            # High confidence thresholds
-            if conf > 0.7:
-                if predicted_stage < 2: # Rising phase (stages 0, 1)
-                    signals[pos] = 1 # Buy
-                elif predicted_stage > 3: # Falling phase (stage 4)
-                    signals[pos] = -1 # Sell
+            
+            # ENTRY SIGNALS
+            # BUY: Zero to positive crossing + ML predicts maximum ahead
+            if is_zero_cross == 1 and next_turn == 1 and conf > self.config.ML_CONFIDENCE_THRESHOLD:
+                signals[pos] = 1
+            
+            # SELL: Zero to negative crossing + ML predicts minimum ahead
+            elif is_zero_cross == -1 and next_turn == -1 and conf > self.config.ML_CONFIDENCE_THRESHOLD:
+                signals[pos] = -1
+            
+            # EXIT SIGNALS
+            # Exit when turning point is imminent (within 2 bars)
+            if distance <= 2 and conf > self.config.ML_CONFIDENCE_THRESHOLD:
+                if next_turn == 1:  # Maximum approaching - exit long
+                    exit_signals[pos] = 1
+                elif next_turn == -1:  # Minimum approaching - exit short
+                    exit_signals[pos] = -1
        
         features_df['ml_signal'] = signals
+        features_df['ml_exit_signal'] = exit_signals
         features_df['ml_confidence'] = 0
        
         # Add confidence for valid indices
         for i, idx in enumerate(valid_features.index):
-            pos = features_df.index.get_loc(idx)
             features_df.loc[idx, 'ml_confidence'] = confidence[i]
        
         return features_df
    
     def backtest_ml_strategy(self, df, initial_balance=10000, commission=2.5):
-        """Backtest ML-based strategy"""
+        """Enhanced backtest with ML-based strategy and risk management"""
         if 'ml_signal' not in df.columns:
             print("No ML signals generated")
             return df, []
        
+        # Initialize risk manager
+        self.risk_manager.set_initial_balance(initial_balance)
+        
         balance = initial_balance
         position = 0
+        position_size_lots = 0
         entry_price = 0
+        entry_idx = 0
         trades = []
         equity_curve = []
+       
+        # Calculate ATR if not already present
+        if 'atr' not in df.columns:
+            df = self.calculate_atr(df, period=self.config.ATR_PERIOD)
        
         for i in range(len(df)):
             current_price = df['close'].iloc[i]
             signal = df['ml_signal'].iloc[i]
+            exit_signal = df['ml_exit_signal'].iloc[i] if 'ml_exit_signal' in df.columns else 0
             confidence = df['ml_confidence'].iloc[i] if 'ml_confidence' in df.columns else 0
+            atr = df['atr'].iloc[i] if not np.isnan(df['atr'].iloc[i]) else 100
            
-            if np.isnan(current_price) or np.isnan(signal):
+            if np.isnan(current_price):
                 equity_curve.append(balance)
                 continue
-           
-            # Close position on opposite signal
-            if position != 0:
-                if (position > 0 and signal == -1) or (position < 0 and signal == 1):
-                    pnl = (current_price - entry_price) * abs(position) - commission
+            
+            # Update peak balance for drawdown tracking
+            self.risk_manager.update_peak_balance(balance)
+            
+            # Check for max drawdown
+            if self.risk_manager.is_max_drawdown_reached(balance):
+                if position != 0:
+                    # Close position due to max drawdown
+                    pnl = (current_price - entry_price) * position_size_lots * current_price - commission
                     balance += pnl
                     trades.append({
-                        'entry_time': df.index[i-1],
+                        'entry_time': df.index[entry_idx],
                         'exit_time': df.index[i],
                         'entry_price': entry_price,
                         'exit_price': current_price,
                         'position': position,
                         'pnl': pnl,
                         'confidence': confidence,
-                        'type': 'LONG' if position > 0 else 'SHORT'
+                        'type': 'LONG' if position > 0 else 'SHORT',
+                        'exit_reason': 'MAX_DRAWDOWN'
                     })
                     position = 0
+                    position_size_lots = 0
+                equity_curve.append(balance)
+                print(f"Max drawdown reached at bar {i}. Trading stopped.")
+                break
+           
+            # Check exit conditions
+            if position != 0:
+                should_exit = False
+                exit_reason = ""
+                
+                # Check ML exit signal
+                if exit_signal != 0:
+                    if (position > 0 and exit_signal == 1) or (position < 0 and exit_signal == -1):
+                        should_exit = True
+                        exit_reason = "ML_EXIT_SIGNAL"
+                
+                # Check other exit conditions
+                if not should_exit:
+                    should_exit, exit_reason = self.should_exit_position(df, position, i)
+                
+                # Close position on opposite entry signal
+                if not should_exit and ((position > 0 and signal == -1) or (position < 0 and signal == 1)):
+                    should_exit = True
+                    exit_reason = "OPPOSITE_SIGNAL"
+                
+                if should_exit:
+                    pnl = (current_price - entry_price) * position_size_lots * current_price - commission
+                    balance += pnl
+                    trades.append({
+                        'entry_time': df.index[entry_idx],
+                        'exit_time': df.index[i],
+                        'entry_price': entry_price,
+                        'exit_price': current_price,
+                        'position': position,
+                        'pnl': pnl,
+                        'confidence': confidence,
+                        'type': 'LONG' if position > 0 else 'SHORT',
+                        'exit_reason': exit_reason
+                    })
+                    position = 0
+                    position_size_lots = 0
+                    # Clear position tracking
+                    self.position_peak_hist = {}
            
             # Open new position
-            if position == 0 and signal != 0 and confidence > 0.5:
-                # Dynamic position sizing based on confidence
-                position_pct = min(0.2, 0.1 * (1 + confidence))
-                position_size = int((balance * position_pct) / current_price)
-               
-                if position_size > 0:
-                    position = position_size if signal == 1 else -position_size
-                    entry_price = current_price
-                    balance -= commission
+            if position == 0 and signal != 0 and confidence > self.config.ML_CONFIDENCE_THRESHOLD:
+                # Check if we can open a position
+                if self.risk_manager.can_open_position():
+                    # Calculate position size using risk management
+                    lots = self.risk_manager.calculate_position_size(balance, confidence, atr, current_price)
+                    
+                    if lots > 0:
+                        position = 1 if signal == 1 else -1
+                        position_size_lots = lots
+                        entry_price = current_price
+                        entry_idx = i
+                        balance -= commission
            
             equity_curve.append(balance)
+       
+        # Close any remaining position
+        if position != 0:
+            pnl = (df['close'].iloc[-1] - entry_price) * position_size_lots * df['close'].iloc[-1] - commission
+            balance += pnl
+            trades.append({
+                'entry_time': df.index[entry_idx],
+                'exit_time': df.index[-1],
+                'entry_price': entry_price,
+                'exit_price': df['close'].iloc[-1],
+                'position': position,
+                'pnl': pnl,
+                'confidence': confidence,
+                'type': 'LONG' if position > 0 else 'SHORT',
+                'exit_reason': 'END_OF_DATA'
+            })
        
         df['ml_equity'] = equity_curve[:len(df)]
         return df, trades
@@ -1206,32 +1604,194 @@ class EnhancedTradingBot:
                 print(f"Closed position {pos.ticket}")
     
     def start_autonomous_trading(self):
-        """Start autonomous trading loop"""
+        """Enhanced autonomous trading loop with full risk management"""
         if not self.connected or not self.model_trained:
+            logger.error("Cannot start autonomous trading: Not connected or model not trained")
             print("Cannot start autonomous trading: Not connected or model not trained")
             return
         
-        print("Starting autonomous trading... Press Ctrl+C to stop")
+        logger.info("="*60)
+        logger.info("STARTING AUTONOMOUS TRADING")
+        logger.info("="*60)
+        print("\n🤖 Starting autonomous trading... Press Ctrl+C to stop")
+        
         try:
+            iteration = 0
             while True:
-                signal, confidence = self.get_latest_signal()
+                iteration += 1
+                logger.info(f"Trading iteration {iteration}")
                 
-                if signal == 1 and self.current_position != 1 and confidence > 0.5:
-                    self.close_all()
-                    if self.open_buy(lot=0.01):
-                        self.current_position = 1
-                elif signal == -1 and self.current_position != -1 and confidence > 0.5:
-                    self.close_all()
-                    if self.open_sell(lot=0.01):
-                        self.current_position = -1
-                elif signal == 0 and self.current_position != 0:
-                    self.close_all()
-                    self.current_position = 0
+                # Get current account info
+                account_info = mt5.account_info()
+                if not account_info:
+                    logger.error("Failed to get account info")
+                    time.sleep(60)
+                    continue
                 
-                time.sleep(300)  # Wait 5 minutes
+                current_balance = account_info.balance
+                current_equity = account_info.equity
+                
+                # Update risk manager
+                self.risk_manager.update_peak_balance(current_equity)
+                
+                # Check max drawdown
+                if self.risk_manager.is_max_drawdown_reached(current_equity):
+                    logger.critical("MAX DRAWDOWN REACHED! Closing all positions and stopping.")
+                    print("\n⚠️ MAX DRAWDOWN REACHED! Closing all positions and stopping.")
+                    self.close_all()
+                    break
+                
+                # Get latest signal and confidence
+                signal, confidence, data = self.get_latest_signal_with_data()
+                
+                if data is None:
+                    logger.warning("Failed to get market data")
+                    time.sleep(60)
+                    continue
+                
+                # Get current positions
+                positions = mt5.positions_get(symbol=self.config.SYMBOL)
+                num_positions = len(positions) if positions else 0
+                
+                # Get current MACD and ATR
+                current_macd_hist = data['macd_hist'].iloc[-1]
+                current_atr = data['atr'].iloc[-1] if 'atr' in data.columns else 100
+                current_price = data['close'].iloc[-1]
+                
+                logger.info(f"Balance: ${current_balance:.2f} | Equity: ${current_equity:.2f} | " +
+                           f"Positions: {num_positions} | Signal: {signal} | Confidence: {confidence:.2f}")
+                logger.info(f"MACD Hist: {current_macd_hist:.4f} | ATR: {current_atr:.2f} | Price: {current_price:.2f}")
+                
+                # Check exit conditions for existing positions
+                if num_positions > 0:
+                    for pos in positions:
+                        should_exit = False
+                        exit_reason = ""
+                        
+                        pos_type = 1 if pos.type == mt5.POSITION_TYPE_BUY else -1
+                        
+                        # Check if opposite signal
+                        if (pos_type == 1 and signal == -1) or (pos_type == -1 and signal == 1):
+                            should_exit = True
+                            exit_reason = "Opposite signal detected"
+                        
+                        # Check exit conditions
+                        if not should_exit:
+                            should_exit, exit_reason = self.should_exit_position(data, pos_type, len(data)-1)
+                        
+                        if should_exit:
+                            logger.info(f"Closing position {pos.ticket}: {exit_reason}")
+                            print(f"📤 Closing position: {exit_reason}")
+                            self.close_position(pos.ticket)
+                            self.current_position = 0
+                
+                # Open new positions if signal present
+                if signal != 0 and confidence > self.config.ML_CONFIDENCE_THRESHOLD:
+                    # Check if we can open a new position
+                    if self.risk_manager.can_open_position():
+                        # Calculate position size
+                        lots = self.risk_manager.calculate_position_size(
+                            current_balance, confidence, current_atr, current_price
+                        )
+                        
+                        if signal == 1 and self.current_position != 1:
+                            logger.info(f"🚀 BUY signal - Opening long position: {lots} lots")
+                            print(f"\n🚀 BUY signal detected! Opening long position: {lots} lots")
+                            print(f"   Confidence: {confidence:.1%} | MACD Hist: {current_macd_hist:.4f}")
+                            if self.open_buy(lot=lots):
+                                self.current_position = 1
+                        
+                        elif signal == -1 and self.current_position != -1:
+                            logger.info(f"🔻 SELL signal - Opening short position: {lots} lots")
+                            print(f"\n🔻 SELL signal detected! Opening short position: {lots} lots")
+                            print(f"   Confidence: {confidence:.1%} | MACD Hist: {current_macd_hist:.4f}")
+                            if self.open_sell(lot=lots):
+                                self.current_position = -1
+                    else:
+                        logger.warning("Maximum concurrent positions reached")
+                        print("⏸️ Maximum concurrent positions reached")
+                
+                # Display status
+                if iteration % 12 == 0:  # Every hour
+                    self.show_account_status()
+                
+                # Wait for next bar (5 minutes)
+                logger.info("Waiting for next 5-minute bar...")
+                time.sleep(300)
+                
         except KeyboardInterrupt:
-            print("Stopping autonomous trading")
+            logger.info("Autonomous trading stopped by user")
+            print("\n⏹️ Stopping autonomous trading...")
             self.close_all()
+        except Exception as e:
+            logger.error(f"Error in autonomous trading: {e}", exc_info=True)
+            print(f"\n❌ Error: {e}")
+            self.close_all()
+    
+    def close_position(self, ticket):
+        """Close a specific position by ticket"""
+        if not self.connected:
+            return False
+        
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return False
+        
+        pos = positions[0]
+        
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = mt5.symbol_info_tick(self.config.SYMBOL).bid
+        else:
+            order_type = mt5.ORDER_TYPE_BUY
+            price = mt5.symbol_info_tick(self.config.SYMBOL).ask
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.config.SYMBOL,
+            "volume": pos.volume,
+            "type": order_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": 234000,
+            "comment": "ML Close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"Closed position {pos.ticket}")
+            return True
+        else:
+            logger.error(f"Failed to close position {pos.ticket}: {result.comment}")
+            return False
+    
+    def get_latest_signal_with_data(self):
+        """Get latest ML signal, confidence, and data for exit analysis"""
+        if not self.connected or not self.model_trained:
+            return 0, 0, None
+        
+        # Get recent data (last 60 days for feature calculation)
+        end_date = pd.Timestamp.now()
+        start_date = end_date - pd.Timedelta(days=60)
+       
+        data = self.get_historical_data(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+       
+        if data is not None and len(data) > 0:
+            # Calculate features
+            data = self.calculate_macd(data)
+            data = self.calculate_atr(data, period=self.config.ATR_PERIOD)
+            features_df = self.feature_engine.engineer_features(data)
+            features_df = self.generate_ml_signals(features_df)
+           
+            # Get latest signals
+            latest_signal = features_df['ml_signal'].iloc[-1] if 'ml_signal' in features_df.columns else 0
+            latest_confidence = features_df['ml_confidence'].iloc[-1] if 'ml_confidence' in features_df.columns else 0
+            
+            return latest_signal, latest_confidence, features_df
+        
+        return 0, 0, None
    
     def show_account_status(self):
         """Show account status including balance, equity, and open positions"""
